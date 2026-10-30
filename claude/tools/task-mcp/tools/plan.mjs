@@ -3,13 +3,16 @@ import path from 'node:path';
 
 import {
   OWNER,
+  applyMode,
   markdownRecordFileName,
   now,
   numberedMarkdownFiles,
   parseMarkdownRecord,
   renderMarkdownRecord,
+  rejectLegacyAppend,
   requireGroup,
   requireWritableGroup,
+  withLineNumbers,
 } from '../lib.mjs';
 
 const PREFIX = 'plan';
@@ -86,19 +89,12 @@ function readPlan(groupDir, number) {
 }
 
 function emptySections(sections) {
-  return sections.filter((section) => section.body.includes(EMPTY));
+  return sections.filter((section) => !section.body.trim() || section.body.includes(EMPTY));
 }
 
 function emptySummary(sections) {
   const empty = emptySections(sections);
   return `안 채운 칸 ${empty.length}개: ${empty.length ? empty.map((section) => section.title).join(', ') : '없음'}`;
-}
-
-function appendSectionBody(current, added) {
-  const existing = current.includes(EMPTY) ? '' : current;
-  if (!existing) return added;
-  if (!added) return existing;
-  return `${existing}\n\n${added}`;
 }
 
 export function toolGroupPlanAdd({ group_id, title }) {
@@ -115,18 +111,24 @@ export function toolGroupPlanAdd({ group_id, title }) {
   return `계획서 추가: group_id="${found.safe}", number=${number}, file="plans/${file}".\n${emptySummary(parsePlanBody(emptyPlanBody()))}`;
 }
 
-export function toolGroupPlanUpdate({ group_id, number, section, body, append }) {
-  if (!group_id || number == null || section == null || body == null) {
-    throw new Error('group_id, number, section, body는 필수입니다.');
+export function toolGroupPlanUpdate(args) {
+  const { group_id, number, section } = args;
+  if (!group_id || number == null || section == null) {
+    throw new Error('group_id, number, section은 필수입니다.');
   }
+  rejectLegacyAppend(args);
+  if (Object.hasOwn(args, 'body')) rejectLegacyAppend({ body: args.body });
   const definition = PLAN_SECTIONS.find((candidate) => candidate.key === section);
   if (!definition) throw new Error(`section은 ${PLAN_SECTION_KEYS.join(' | ')} 중 하나여야 합니다.`);
   const readable = requireGroup(group_id);
-  readPlan(readable.dir, number);
-  const found = requireWritableGroup(group_id);
-  const plan = readPlan(found.dir, number);
+  const plan = readPlan(readable.dir, number);
   const target = plan.sections.find((candidate) => candidate.key === definition.key);
-  target.body = append ? appendSectionBody(target.body, String(body)) : String(body);
+  target.body = applyMode(target.body === EMPTY ? '' : target.body, args);
+  const nextBody = renderPlanBody(plan.sections);
+  const parsed = parsePlanBody(nextBody);
+  if (parsed.some((entry, index) => entry.body !== plan.sections[index].body)) {
+    throw new Error('본문에 다른 고정 칸의 제목을 넣어 계획서 틀을 바꿀 수 없습니다');
+  }
   const metadata = planMetadata(
     number,
     plan.metadata.title,
@@ -134,15 +136,20 @@ export function toolGroupPlanUpdate({ group_id, number, section, body, append })
     plan.metadata.created_at,
     now(),
   );
-  fs.writeFileSync(plan.full, renderMarkdownRecord(metadata, renderPlanBody(plan.sections)));
-  return `계획서 업데이트: group_id="${found.safe}", number=${number}, section=${section}.\n${emptySummary(plan.sections)}`;
+  const nextText = renderMarkdownRecord(metadata, nextBody);
+  const found = requireWritableGroup(group_id);
+  fs.writeFileSync(path.join(plansDir(found.dir), plan.file), nextText);
+  return `계획서를 수정했습니다: group_id="${found.safe}", number=${number}, section=${section}.\n${emptySummary(plan.sections)}`;
 }
 
 export function toolGroupPlanGet({ group_id, number }) {
   if (!group_id || number == null) throw new Error('group_id, number는 필수입니다.');
   const found = requireGroup(group_id);
   const plan = readPlan(found.dir, number);
-  return `${plan.text.trimEnd()}\n\n${emptySummary(plan.sections)}`;
+  const headerEnd = plan.text.indexOf('\n---\n', 4) + 5;
+  return `${plan.text.slice(0, headerEnd)}\n${withLineNumbers(plan.body)}\n\n` +
+    `편집 안내: insert_after는 section 안의 본문 줄 번호이며 1부터 셉니다. 위 번호는 전체 본문 번호입니다.\n` +
+    `${emptySummary(plan.sections)}`;
 }
 
 export function toolGroupPlanList({ group_id }) {

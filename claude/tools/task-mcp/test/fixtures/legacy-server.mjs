@@ -1,5 +1,15 @@
 #!/usr/bin/env node
-// 2026-08-16 분리 전 코드의 언 사본이며 G1의 비교 기준이니 고치지 말 것.
+// 2026-08-16 분리 전 코드의 언 사본이다. 고치지 말 것.
+//
+// 쓰는 곳은 이제 한 자리뿐이다 — test/mcp-task-root-compat.test.mjs 의 「호환 symlink에서는 동결
+// 서버와 현재 서버의 쓰기가 서로 보인다」. .claude/tasks -> mcp-task 심볼릭 링크를 사이에 두고
+// 아직 떠 있는 옛 서버 프로세스와 지금 서버가 같은 장부를 보는지 검사한다.
+//
+// 2026-09-18 개편에서 g1-split-parity 는 은퇴했다(SPEC 8절 · 매니저 결정 M-11). 분리 전 서버와
+// 출력이 같은지 보는 검사인데 이번 개편은 출력이 바뀌는 것이 목적이라 성립하지 않는다. 이 파일이
+// 남은 까닭은 파리티 비교가 아니라 위의 심볼릭 링크 검사가 「옛 코드를 실제로 띄워」 봐야 하기
+// 때문이다. 그래서 새 계약(members · TASK_GROUP.json · batch)을 여기에 반영하지 않는다.
+//
 // task-mcp — 무의존성 MCP stdio 서버 (프로젝트별 파일 기반 태스크)
 //
 // 저장: <project>/.claude/tasks/{YYYY-MM-DD}-{slug(group)}/task-{number}-{status}.json

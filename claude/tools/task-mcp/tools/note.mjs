@@ -3,13 +3,16 @@ import path from 'node:path';
 
 import {
   OWNER,
+  applyMode,
   markdownRecordFileName,
   now,
   numberedMarkdownFiles,
   parseMarkdownRecord,
   renderMarkdownRecord,
+  rejectLegacyAppend,
   requireGroup,
   requireWritableGroup,
+  withLineNumbers,
 } from '../lib.mjs';
 
 const PREFIX = 'note';
@@ -43,12 +46,6 @@ function readNote(groupDir, number) {
   return { ...entry, full, text, ...parsed };
 }
 
-function appendBody(current, added) {
-  if (!current) return added;
-  if (!added) return current;
-  return `${current}\n\n${added}`;
-}
-
 export function toolGroupNoteAdd({ group_id, title, body }) {
   if (!group_id || !title || body == null) throw new Error('group_id, title, body는 필수입니다.');
   const found = requireWritableGroup(group_id);
@@ -64,17 +61,20 @@ export function toolGroupNoteAdd({ group_id, title, body }) {
   return `노트 추가: group_id="${found.safe}", number=${number}, file="notes/${file}".`;
 }
 
-export function toolGroupNoteUpdate({ group_id, number, title, body, append }) {
+export function toolGroupNoteUpdate(args) {
+  const { group_id, number, title, field } = args;
   if (!group_id || number == null) throw new Error('group_id, number는 필수입니다.');
-  if (title == null && body == null) throw new Error('바꿀 값(title / body 중 하나 이상)이 필요합니다.');
+  rejectLegacyAppend(args);
+  if (Object.hasOwn(args, 'body')) rejectLegacyAppend({ body: args.body });
+  if (field != null && field !== 'body') throw new Error('field 는 body 여야 합니다');
+  if (field == null && ['mode', 'text', 'at', 'old', 'new', 'replace_all', 'insert_after'].some((key) => Object.hasOwn(args, key))) {
+    throw new Error('본문을 고치려면 field:"body" 를 주십시오');
+  }
+  if (title == null && field == null) throw new Error('바꿀 값(title 또는 field)이 필요합니다');
   const readable = requireGroup(group_id);
-  readNote(readable.dir, number);
-  const found = requireWritableGroup(group_id);
-  const note = readNote(found.dir, number);
+  const note = readNote(readable.dir, number);
   const nextTitle = title == null ? note.metadata.title : String(title);
-  const nextBody = body == null
-    ? note.body
-    : append ? appendBody(note.body, String(body)) : String(body);
+  const nextBody = field == null ? note.body : applyMode(note.body, args);
   const metadata = noteMetadata(
     number,
     nextTitle,
@@ -83,24 +83,26 @@ export function toolGroupNoteUpdate({ group_id, number, title, body, append }) {
     now(),
   );
   const nextFile = markdownRecordFileName(PREFIX, number, nextTitle);
-  fs.writeFileSync(note.full, renderMarkdownRecord(metadata, nextBody));
-  if (nextFile !== note.file) fs.renameSync(note.full, path.join(notesDir(found.dir), nextFile));
-  return `노트 업데이트: group_id="${found.safe}", number=${number}, file="notes/${nextFile}".`;
+  const nextText = renderMarkdownRecord(metadata, nextBody);
+  const found = requireWritableGroup(group_id);
+  const full = path.join(notesDir(found.dir), note.file);
+  fs.writeFileSync(full, nextText);
+  if (nextFile !== note.file) fs.renameSync(full, path.join(notesDir(found.dir), nextFile));
+  return `노트를 수정했습니다: group_id="${found.safe}", number=${number}, file="notes/${nextFile}".`;
 }
 
 export function toolGroupNoteGet({ group_id, number }) {
   if (!group_id || number == null) throw new Error('group_id, number는 필수입니다.');
   const found = requireGroup(group_id);
-  return readNote(found.dir, number).text;
+  const note = readNote(found.dir, number);
+  const headerEnd = note.text.indexOf('\n---\n', 4) + 5;
+  return `${note.text.slice(0, headerEnd)}\n${withLineNumbers(note.body)}\n`;
 }
 
 export function toolGroupNoteList({ group_id }) {
   if (!group_id) throw new Error('group_id는 필수입니다.');
   const found = requireGroup(group_id);
   const lines = [];
-  if (fs.existsSync(path.join(found.dir, 'NOTES.md'))) {
-    lines.push('NOTES.md (옛 자리 · 읽기 전용)');
-  }
   for (const entry of numberedMarkdownFiles(notesDir(found.dir), PREFIX)) {
     const note = readNote(found.dir, entry.number);
     lines.push(`#${entry.number} ${note.metadata.title} · 작성 ${note.metadata.author || '(없음)'} · 생성 ${note.metadata.created_at} · 수정 ${note.metadata.updated_at}`);

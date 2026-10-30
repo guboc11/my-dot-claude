@@ -4,7 +4,7 @@
 # 원칙:
 #   1. --delete 로 미러링한다 — 홈에서 지운 것은 레포에서도 지워져 좀비가 안 남는다.
 #      위험하지 않은 이유: 도착지가 git 워킹트리라 커밋 전에 diff 로 전부 보인다.
-#   2. skills 는 manifest.sh 의 제외 목록(외부 사본·심볼릭)을 빼고 자작만 수집한다.
+#   2. skills·tools 는 manifest.sh 의 제외 목록(외부 사본·심볼릭·대용량 실행 파일)을 빼고 자작만 수집한다.
 #   3. 커밋·푸시는 하지 않는다 — 마지막에 git status 를 보여주고 사람이 확정한다.
 #   4. --dry-run 이면 무엇이 수집·삭제될지만 보여주고 아무것도 바꾸지 않는다.
 
@@ -33,12 +33,18 @@ SKILL_EXCLUDE_FLAGS=()
 for e in "${SKILL_EXCLUDES[@]}"; do
   SKILL_EXCLUDE_FLAGS+=(--exclude "/$e")
 done
+TOOL_EXCLUDE_FLAGS=()
+for e in "${TOOL_EXCLUDES[@]}"; do
+  TOOL_EXCLUDE_FLAGS+=(--exclude "/$e")
+done
 
 echo "== 수집: $SRC → $DEST =="
 for t in "${TARGETS[@]}"; do
   if [ -d "$SRC/$t" ]; then
     if [ "$t" = "skills" ]; then
       rsync "${RSYNC_FLAGS[@]}" "${SKILL_EXCLUDE_FLAGS[@]}" "$SRC/$t/" "$DEST/$t/"
+    elif [ "$t" = "tools" ]; then
+      rsync "${RSYNC_FLAGS[@]}" "${TOOL_EXCLUDE_FLAGS[@]}" "$SRC/$t/" "$DEST/$t/"
     else
       rsync "${RSYNC_FLAGS[@]}" "$SRC/$t/" "$DEST/$t/"
     fi

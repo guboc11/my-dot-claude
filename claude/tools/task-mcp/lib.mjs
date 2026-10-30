@@ -2,12 +2,95 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-export const STATUSES = ['pending', 'in_progress', 'completed'];
+import { normalizeMembers, parseTaskFileName } from './model.mjs';
+
+// 태스크 상태·표식·파일 이름·명단 규칙의 원천은 model.mjs 다. 값은 재수출로만 넘긴다 —
+// `const X = model.X` 로 받으면 두 파일이 서로를 부르는 자리에서 초기화 전 접근이 된다.
+export { MARK, STATUSES } from './model.mjs';
 export const GROUP_STATUSES = ['pending', 'in_progress', 'done'];
-export const MARK = { pending: '[ ]', in_progress: '[~]', completed: '[x]' };
-export const RESERVED_CAMPAIGN_DIRS = new Set(['campaign-context', 'main-context', 'researches']);
 // owner = 태스크를 만든 패널(CMUX_SURFACE_ID). task_list 기본은 자기 owner 것만 = 패널 간 격리.
 export const OWNER = process.env.CMUX_SURFACE_ID || '';
+
+export function rejectLegacyAppend(args) {
+  if (Object.hasOwn(args, 'append') || (Object.hasOwn(args, 'body') && !Object.hasOwn(args, 'field'))) {
+    throw new Error('append 플래그는 없어졌습니다. mode:"append" 를 쓰십시오');
+  }
+}
+
+export function withLineNumbers(text) {
+  const source = String(text ?? '');
+  if (!source) return '';
+  return source.split('\n').map((line, index) => `${String(index + 1).padStart(4)}│ ${line}`).join('\n');
+}
+
+export function applyMode(current, args = {}) {
+  rejectLegacyAppend(args);
+  const { mode, text, at = 'end', old, new: replacement, replace_all, insert_after, gap } = args;
+  if (mode == null) throw new Error('field 에는 mode 가 있어야 합니다 (append | edit | replace)');
+  if (!['append', 'edit', 'replace'].includes(mode)) {
+    throw new Error('mode 는 append | edit | replace 중 하나여야 합니다');
+  }
+  const source = String(current ?? '');
+  const has = (key) => Object.hasOwn(args, key);
+  const requireText = () => {
+    if (typeof text !== 'string') throw new Error('text 는 문자열이어야 합니다');
+  };
+
+  if (has('gap') && mode !== 'append') throw new Error('gap 은 mode:"append" 에서만 씁니다');
+  if (has('gap') && typeof gap !== 'boolean') throw new Error('gap 은 boolean 이어야 합니다');
+
+  if (mode !== 'edit') {
+    if (['old', 'new', 'replace_all', 'insert_after'].some(has)) {
+      throw new Error('old · new · replace_all · insert_after 는 mode:"edit" 에서만 씁니다');
+    }
+    requireText();
+    if (mode === 'replace') {
+      if (has('at')) throw new Error('at 은 mode:"append" 에서만 씁니다');
+      return text;
+    }
+    if (!['start', 'end'].includes(at)) throw new Error('at 은 start | end 중 하나여야 합니다');
+    if (!source) return text;
+    if (!text) return source;
+    // 기본은 빈 줄 하나를 사이에 둡니다 — 문단을 잇는 자리라 그것이 맞습니다.
+    // gap:false 는 줄바꿈 하나만 둡니다. 표에 행을 붙일 때 빈 줄이 표를 끊던 자리입니다(백로그 15).
+    // 붙이는 글이 표 행인지 도구가 알아서 판정하지 않습니다 — 부르는 쪽이 정합니다.
+    const joint = gap === false ? '\n' : '\n\n';
+    return at === 'start' ? `${text}${joint}${source}` : `${source}${joint}${text}`;
+  }
+
+  if (has('at')) throw new Error('at 은 mode:"append" 에서만 씁니다');
+  if (has('insert_after')) {
+    if (['old', 'new', 'replace_all'].some(has)) {
+      throw new Error('edit 에는 old/new 또는 insert_after/text 중 한 가지 방식만 주십시오');
+    }
+    requireText();
+    if (!Number.isInteger(insert_after) || insert_after < 0) {
+      throw new Error('insert_after 는 0 이상의 정수여야 합니다');
+    }
+    const lines = source ? source.split('\n') : [];
+    if (insert_after > lines.length) throw new Error(`줄이 ${lines.length} 개뿐입니다`);
+    if (!text) return source;
+    lines.splice(insert_after, 0, text);
+    return lines.join('\n');
+  }
+
+  if (has('text')) throw new Error('edit 에는 old/new 또는 insert_after/text 중 한 가지 방식만 주십시오');
+  if (typeof old !== 'string' || typeof replacement !== 'string') {
+    throw new Error('old 와 new 는 문자열이어야 합니다');
+  }
+  if (old === replacement) throw new Error('old 와 new 가 같습니다');
+  if (!old) throw new Error('old 는 빈 문자열일 수 없습니다');
+  if (has('replace_all') && typeof replace_all !== 'boolean') {
+    throw new Error('replace_all 은 boolean 이어야 합니다');
+  }
+  let count = 0;
+  for (let index = source.indexOf(old); index !== -1; index = source.indexOf(old, index + 1)) count += 1;
+  if (!count) throw new Error('old 를 찾지 못했습니다');
+  if (count > 1 && replace_all !== true) {
+    throw new Error(`old 가 ${count} 군데에 있습니다. replace_all:true 로 전부 바꾸거나 old 를 더 길게 주십시오`);
+  }
+  return source.split(old).join(replacement);
+}
 
 export function projectDir() {
   return process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -21,10 +104,19 @@ export function legacyTasksRoot() {
   return path.join(projectDir(), '.claude', 'tasks');
 }
 
-// 캠페인 = 그룹 위의 한 층. 여러 태스크 그룹과 여러 계획서·조사가 딸리는 큰 일을 담는다.
-// 날짜 접두를 붙이지 않는다 — 몇 달을 가므로 시작일이 이름에 박히면 방해가 된다.
+// 보고 기록. 한 줄이 한 보고이고 뒤에 붙이기만 한다(대본 4절).
+export function queuePath(groupDir) {
+  return path.join(groupDir, 'MANAGER_MESSAGE_QUEUE.jsonl');
+}
+
+// 새 경로를 우선하며, 아직 이관하지 않은 프로젝트에서는 옛 루트를 읽고 씁니다.
 export function campaignsRoot() {
-  return path.join(projectDir(), '.claude', 'campaigns');
+  const current = path.join(projectDir(), '.claude', 'mcp-task-campaign');
+  return fs.existsSync(current) ? current : path.join(projectDir(), '.claude', 'campaigns');
+}
+
+export function backlogRoot() {
+  return path.join(projectDir(), '.claude', 'mcp-task-backlog');
 }
 
 export function safeName(name) {
@@ -36,11 +128,11 @@ export function campaignDir(name) {
 }
 
 export function campaignContextDir(name) {
-  return path.join(campaignDir(name), 'campaign-context');
+  return path.join(campaignDir(name), 'campaign-main-context');
 }
 
-export function mainContextDir(name) {
-  return path.join(campaignDir(name), 'main-context');
+export function campaignNotesDir(name) {
+  return path.join(campaignDir(name), 'campaign-notes');
 }
 
 export function subDirNames(root) {
@@ -94,14 +186,14 @@ export function groupPath(groupId) {
   // 어느 쪽에 있든 이름은 여전히 폴더명 하나다 — 경로로 바꾸면 기존 group_id 표기가 전부 어긋난다.
   const safe = safeName(groupId);
   const top = path.join(tasksRoot(), safe);
-  if (!RESERVED_CAMPAIGN_DIRS.has(safe)) {
-    if (fs.existsSync(top)) return { safe, dir: top, campaign: null };
-    const legacy = path.join(legacyTasksRoot(), safe);
-    if (fs.existsSync(legacy)) return { safe, dir: legacy, campaign: null };
-    for (const c of listCampaignNames()) {
-      const inCampaign = path.join(campaignsRoot(), c, safe);
-      if (fs.existsSync(inCampaign)) return { safe, dir: inCampaign, campaign: c };
-    }
+  if (fs.existsSync(top)) return { safe, dir: top, campaign: null };
+  const legacy = path.join(legacyTasksRoot(), safe);
+  if (fs.existsSync(legacy)) return { safe, dir: legacy, campaign: null };
+  // 호출자가 옛 ID를 줘도 접두사가 붙은 실물 그룹을 찾습니다. 자료 폴더는 읽지 않습니다.
+  const campaignId = safe.startsWith('task-group-') ? safe : `task-group-${safe}`;
+  for (const c of listCampaignNames()) {
+    const inCampaign = path.join(campaignsRoot(), c, campaignId);
+    if (fs.existsSync(inCampaign)) return { safe: campaignId, dir: inCampaign, campaign: c };
   }
   // 없는 그룹이면 기존과 같은 경로를 돌려준다(오류 메시지가 이전과 같게).
   return { safe, dir: top, campaign: null };
@@ -109,15 +201,15 @@ export function groupPath(groupId) {
 
 export function campaignGroupIds(name) {
   return subDirNames(campaignDir(name))
-    .filter((groupId) => !RESERVED_CAMPAIGN_DIRS.has(groupId))
+    .filter((groupId) => groupId.startsWith('task-group-'))
     .sort();
 }
 
 export function listGroupIds() {
   // 새·옛 독립 자리와 캠페인을 함께 훑는다. 돌려주는 것은 예전처럼 그룹 이름뿐 —
   // 실제 경로는 호출부가 groupPath()로 푼다.
-  const out = subDirNames(tasksRoot()).filter((groupId) => !RESERVED_CAMPAIGN_DIRS.has(groupId));
-  out.push(...subDirNames(legacyTasksRoot()).filter((groupId) => !RESERVED_CAMPAIGN_DIRS.has(groupId)));
+  const out = subDirNames(tasksRoot());
+  out.push(...subDirNames(legacyTasksRoot()));
   for (const c of listCampaignNames()) {
     out.push(...campaignGroupIds(c));
   }
@@ -126,7 +218,7 @@ export function listGroupIds() {
 
 export function requireGroup(groupId) {
   const found = groupPath(groupId);
-  if (!found.safe || RESERVED_CAMPAIGN_DIRS.has(found.safe) || !fs.existsSync(found.dir)) {
+  if (!found.safe || !fs.existsSync(found.dir)) {
     throw new Error(`그룹 "${found.safe}" 없음. task_group_add로 먼저 만드세요.`);
   }
   return found;
@@ -169,29 +261,48 @@ export function requireWritableGroup(groupId) {
   return { safe: found.safe, dir: destination, campaign: null };
 }
 
+// 레코드 파일 이름은 TASK_GROUP.json 이 정본이다. 옛 이름(GROUP.json)은 읽기만 하고,
+// 쓰기가 닿으면 새 이름으로 옮기며 옛 파일을 지운다(SPEC 3-1 · 5-7).
 export function groupRecordPath(dir) {
+  return path.join(dir, 'TASK_GROUP.json');
+}
+
+export function legacyGroupRecordPath(dir) {
   return path.join(dir, 'GROUP.json');
 }
 
 export function readGroupRecord(dir) {
-  const file = groupRecordPath(dir);
-  if (!fs.existsSync(file)) return null;
+  const current = groupRecordPath(dir);
+  const legacy = legacyGroupRecordPath(dir);
+  const file = (fs.existsSync(current) && current) || (fs.existsSync(legacy) && legacy) || null;
+  if (!file) return null;
+  let record;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    record = JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (cause) {
-    throw new Error(`GROUP.json 파싱 실패: ${cause.message}`);
+    throw new Error(`${path.basename(file)} 파싱 실패: ${cause.message}`);
   }
+  // 옛 두 칸(worker · manager)은 메모리에서 members 로 바꿔 읽는다. 파일은 그대로 둔다.
+  record.members = normalizeMembers(record);
+  delete record.worker;
+  delete record.manager;
+  return record;
 }
 
 export function writeGroupRecord(dir, record) {
   fs.writeFileSync(groupRecordPath(dir), `${JSON.stringify(record, null, 2)}\n`);
+  const legacy = legacyGroupRecordPath(dir);
+  if (fs.existsSync(legacy)) fs.rmSync(legacy, { force: true });
 }
 
 export function taskStatusFromFile(file) {
-  return /^task-\d+-(pending|in_progress|completed)(?:-|\.json$)/.exec(file)?.[1] || null;
+  return parseTaskFileName(file)?.status || null;
 }
 
+// 파일 이름이 정본이고, 표 밖 상태(예: 2026-07-31 의 cancelled 10개)는 레코드의 status 로 물러선다.
+// 그런 태스크는 옛 꼴(kind work · 배치 없음)로 읽되 바꿀 수 없는 것으로 다룬다(매니저 결정 M-7).
 export function normalizeTaskRecord(data, file, number) {
+  const parsed = parseTaskFileName(file);
   return {
     ...data,
     number,
@@ -200,7 +311,17 @@ export function normalizeTaskRecord(data, file, number) {
     depends_on: Array.isArray(data.depends_on) ? data.depends_on : [],
     priority: Number.isInteger(data.priority) ? data.priority : 0,
     assignee: data.assignee ?? data.owner ?? '',
-    status: taskStatusFromFile(file) || data.status,
+    status: parsed?.status || data.status,
+    batch: parsed?.batch || data.batch || '',
+    kind: parsed?.kind || data.kind || 'work',
+    spec: data.spec ?? '',
+    memo: data.memo ?? '',
+    result: data.result ?? '',
+    outcome: data.outcome ?? null,
+    rejected: Array.isArray(data.rejected) ? data.rejected : [],
+    target: Array.isArray(data.target) ? data.target : [],
+    caused_by: data.caused_by ?? null,
+    legacy: parsed ? parsed.legacy : true,
     file,
   };
 }

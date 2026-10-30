@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { after, test } from 'node:test';
+import { after, before, test } from 'node:test';
 
 import { renderMarkdownRecord } from '../lib.mjs';
 import {
   LEGACY_SERVER,
   PROJECT_SERVER,
   callTool,
+  callToolError,
   legacyTaskGroupDir,
   legacyTaskRoot,
   makeProject,
@@ -18,9 +19,18 @@ import {
 } from './helpers.mjs';
 
 const projects = [];
+// 이 파일의 쓰기도 보고를 냅니다. 실제 cmux 로 나가지 않게 가짜 어댑터를 켭니다.
+let savedFakeCmux;
+
+before(() => {
+  savedFakeCmux = process.env.TASK_MCP_FAKE_CMUX;
+  process.env.TASK_MCP_FAKE_CMUX = '1';
+});
 
 after(() => {
   for (const project of projects) removeProject(project);
+  if (savedFakeCmux === undefined) delete process.env.TASK_MCP_FAKE_CMUX;
+  else process.env.TASK_MCP_FAKE_CMUX = savedFakeCmux;
 });
 
 function fixture(prefix) {
@@ -111,7 +121,9 @@ test('저장 뿌리: 새 그룹과 새 태스크·노트·계획서는 .claude/m
   const output = callTool(PROJECT_SERVER, project, 'task_group_add', { topic: '새 뿌리 쓰기' });
   const groupId = /group_id="([^"]+)"/.exec(output)?.[1];
   assert.ok(groupId);
-  callTool(PROJECT_SERVER, project, 'task_add', { group_id: groupId, content: '새 태스크' });
+  callTool(PROJECT_SERVER, project, 'task_add', {
+    group_id: groupId, content: '새 태스크', batch: 'b1', spec: '받아들임 조건',
+  });
   callTool(PROJECT_SERVER, project, 'task_group_note_add', {
     group_id: groupId,
     title: '새 노트',
@@ -122,7 +134,7 @@ test('저장 뿌리: 새 그룹과 새 태스크·노트·계획서는 .claude/m
   const dir = mcpTaskGroupDir(project, groupId);
   assert.equal(fs.existsSync(dir), true);
   assert.equal(fs.existsSync(legacyTaskRoot(project)), false);
-  assert.equal(fs.existsSync(path.join(dir, 'GROUP.json')), true);
+  assert.equal(fs.existsSync(path.join(dir, 'TASK_GROUP.json')), true);
   assert.ok(taskFile(dir));
   assert.deepEqual(fs.readdirSync(path.join(dir, 'notes')), ['note-1-새-노트.md']);
   assert.deepEqual(fs.readdirSync(path.join(dir, 'plans')), ['plan-1-새-계획.md']);
@@ -158,20 +170,26 @@ test('저장 뿌리: 옛 그룹 수정은 그룹 전체를 새 자리로 승격�
   const before = treeChecksum(legacyDir);
 
   callTool(PROJECT_SERVER, project, 'task_group_update', { group_id: groupId, title: '승격 후 그룹' });
-  callTool(PROJECT_SERVER, project, 'task_update', { group_id: groupId, number: 1, content: '승격 후 태스크' });
-  callTool(PROJECT_SERVER, project, 'task_group_note_update', { group_id: groupId, number: 1, body: '승격 후 노트' });
+  // 태스크를 고치는 패널은 명단에 있어야 합니다(백로그 9). seedGroup 의 옛 레코드에 적힌 워커로 부릅니다.
+  callTool(PROJECT_SERVER, project, 'task_update', { group_id: groupId, number: 1, content: '승격 후 태스크' }, 'surface:worker');
+  callTool(PROJECT_SERVER, project, 'task_group_note_update', {
+    group_id: groupId, number: 1, field: 'body', mode: 'replace', text: '승격 후 노트',
+  });
   callTool(PROJECT_SERVER, project, 'task_group_plan_update', {
     group_id: groupId,
     number: 1,
     section: 'spec',
-    body: '승격 후 스펙',
+    mode: 'replace',
+    text: '승격 후 스펙',
   });
 
   assert.equal(treeChecksum(legacyDir), before);
   const promotedDir = mcpTaskGroupDir(project, groupId);
   assert.equal(fs.existsSync(path.join(promotedDir, 'extra', 'keep.txt')), true);
   assert.match(fs.readFileSync(path.join(promotedDir, 'NOTES.md'), 'utf8'), /승격전 NOTES 보존/);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(promotedDir, 'GROUP.json'), 'utf8')).title, '승격 후 그룹');
+  // 옛 이름으로 심은 레코드는 승격 사본에서 쓰기가 닿을 때 새 이름으로 옮겨 간다(SPEC 5-7).
+  assert.equal(fs.existsSync(path.join(promotedDir, 'GROUP.json')), false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(promotedDir, 'TASK_GROUP.json'), 'utf8')).title, '승격 후 그룹');
   assert.match(fs.readFileSync(path.join(promotedDir, taskFile(promotedDir)), 'utf8'), /승격 후 태스크/);
   assert.match(fs.readFileSync(path.join(promotedDir, 'notes', 'note-1-승격전-노트.md'), 'utf8'), /승격 후 노트/);
   assert.match(fs.readFileSync(path.join(promotedDir, 'plans', 'plan-1-승격전-계획.md'), 'utf8'), /승격 후 스펙/);
@@ -185,18 +203,19 @@ test('저장 뿌리: 옛 그룹의 task_next는 고를 태스크가 있을 때�
   const legacyDir = seedGroup(legacyTaskRoot(project), groupId, '큐승격');
   const before = treeChecksum(legacyDir);
 
-  const output = callTool(PROJECT_SERVER, project, 'task_next', { group_id: groupId });
-  assert.match(output, /#1 \(in_progress\)/);
+  const output = callTool(PROJECT_SERVER, project, 'task_next', { group_id: groupId }, 'surface:worker');
+  assert.match(output, /#1 \[~\] work \(in_progress\)/);
   assert.equal(treeChecksum(legacyDir), before);
   const promotedDir = mcpTaskGroupDir(project, groupId);
   assert.match(taskFile(promotedDir), /^task-1-in_progress-/);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(promotedDir, 'GROUP.json'), 'utf8')).status, 'in_progress');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(promotedDir, 'TASK_GROUP.json'), 'utf8')).status, 'in_progress');
   console.log('task_next_promotes_before_write=true');
   console.log('task_next_legacy_tree_unchanged=true');
 });
 
 test('저장 뿌리: 호환 symlink에서는 동결 서버와 현재 서버의 쓰기가 서로 보인다', () => {
   const project = fixture('task-mcp-root-symlink-');
+  const currentWorker = '22222222-2222-4222-8222-222222222222';
   fs.mkdirSync(mcpTaskRoot(project), { recursive: true });
   fs.symlinkSync('mcp-task', legacyTaskRoot(project), 'dir');
 
@@ -208,10 +227,25 @@ test('저장 뿌리: 호환 symlink에서는 동결 서버와 현재 서버의 �
   assert.ok(groupId);
   assert.match(callTool(PROJECT_SERVER, project, 'task_get', { group_id: groupId, number: 1 }), /동결 서버가 쓴 태스크/);
 
+  // 현재 서버로 쓰려면 명단에 있어야 합니다(백로그 9). 옛 GROUP.json 은 동결 서버가 계속 읽어야 하므로
+  // 도구로 갱신하지 않고 새 이름 레코드를 따로 두어 현재 서버만 그것을 보게 합니다.
+  fs.writeFileSync(path.join(mcpTaskGroupDir(project, groupId), 'TASK_GROUP.json'), `${JSON.stringify({
+    id: groupId,
+    title: groupId,
+    about: '',
+    status: 'pending',
+    campaign: null,
+    members: [{ name: 'WRKR-CURRENT', surface: currentWorker, ref: null, roles: ['worker'], scope: '', session: null }],
+    created_at: '2026-09-18T00:00:00.000Z',
+    updated_at: '2026-09-18T00:00:00.000Z',
+  }, null, 2)}\n`);
   callTool(PROJECT_SERVER, project, 'task_add', {
     group_id: groupId,
     content: '현재 서버가 쓴 태스크',
-  }, 'surface:current');
+    batch: 'b1',
+    spec: '받아들임 조건',
+    assignee: currentWorker,
+  }, currentWorker);
   const legacyList = callTool(LEGACY_SERVER, project, 'task_list', { group_id: groupId, all: true });
   assert.match(legacyList, /동결 서버가 쓴 태스크/);
   assert.match(legacyList, /현재 서버가 쓴 태스크/);
@@ -237,4 +271,82 @@ test('저장 뿌리: 새·옛 그룹은 합집합이고 같은 ID는 새 자리�
   assert.match(callTool(PROJECT_SERVER, project, 'task_get', { group_id: duplicate, number: 1 }), /새우선 태스크/);
   console.log('new_legacy_group_union=true');
   console.log('duplicate_group_precedence=new');
+});
+
+// 거절된 요청은 옛 그룹을 새 자리로 승격시키지 않습니다(리뷰 29). 승격은 쓰기 직전에만 합니다.
+// 경우마다 임시 프로젝트를 따로 씁니다 — 앞 요청이 만든 사본에 가려지면 검사가 가짜로 통과합니다.
+test('저장 뿌리: 거절된 옛 그룹 요청은 사본도 보고도 남기지 않는다', () => {
+  const MEMBER = '11111111-1111-4111-8111-111111111111';
+  const OTHER_HOLDER = '22222222-2222-4222-8222-222222222222';
+  const STRANGER = '66666666-6666-4666-8666-666666666666';
+  const groupId = '2026-08-01-거절-승격';
+
+  const seedLegacyWithMember = (prefix) => {
+    const project = fixture(prefix);
+    const dir = legacyTaskGroupDir(project, groupId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'TASK_GROUP.json'), `${JSON.stringify({
+      id: groupId,
+      title: groupId,
+      about: '',
+      status: 'pending',
+      campaign: null,
+      members: [{ name: 'MNGR', surface: MEMBER, ref: null, roles: ['manager', 'worker'], scope: '', session: null }],
+      created_at: '2026-08-01T00:00:00.000Z',
+      updated_at: '2026-08-01T00:00:00.000Z',
+    }, null, 2)}\n`);
+    fs.writeFileSync(path.join(dir, 'task-1-pending-옛-일.json'), `${JSON.stringify({
+      number: 1, content: '옛 일', status: 'pending', owner: MEMBER, assignee: MEMBER, group_id: groupId,
+      created_at: '2026-08-01T00:00:00.000Z', updated_at: '2026-08-01T00:00:00.000Z',
+    }, null, 2)}\n`);
+    // 남이 진행 중인 태스크입니다. 반환 거절을 재현할 때 씁니다.
+    fs.writeFileSync(path.join(dir, 'task-2-in_progress-남의-일.json'), `${JSON.stringify({
+      number: 2, content: '남의 일', status: 'in_progress', owner: MEMBER, assignee: OTHER_HOLDER, group_id: groupId,
+      created_at: '2026-08-01T00:00:00.000Z', updated_at: '2026-08-01T00:00:00.000Z',
+    }, null, 2)}\n`);
+    return { project, before: treeChecksum(dir) };
+  };
+
+
+  const refusals = [
+    ['명단 밖 add', STRANGER, 'task_add', { group_id: groupId, content: '몰래', batch: 'b1', spec: '기준' }, /쓸 수 없습니다/],
+    ['명단 밖 update', STRANGER, 'task_update', { group_id: groupId, number: 1, priority: 3 }, /쓸 수 없습니다/],
+    ['없는 선행 add', MEMBER, 'task_add', { group_id: groupId, content: '새 일', batch: 'b1', spec: '기준', assignee: MEMBER, depends_on: [99] }, /없는 번호가 있습니다: #99/],
+    ['없는 선행 update', MEMBER, 'task_update', { group_id: groupId, number: 1, depends_on: [99] }, /없는 번호가 있습니다: #99/],
+    // 전이 거절도 승격 뒤가 아니라 읽기 자리에서 끝나야 합니다.
+    ['잘못된 전이', MEMBER, 'task_update', { group_id: groupId, number: 1, status: 'completed' }, /pending 에서 completed 로는 갈 수 없습니다/],
+    // 편집 거절도 같습니다 — 찾지 못하는 old 는 파일을 쓰기 전에 걸립니다.
+    ['편집 실패', MEMBER, 'task_update', { group_id: groupId, number: 1, field: 'memo', mode: 'edit', old: '없는 글', new: '새 글' }, /old 를 찾지 못했습니다/],
+    // 남의 일을 반환하려는 요청도 사본을 남기지 않습니다.
+    ['남의 반환', MEMBER, 'task_update', { group_id: groupId, number: 2, status: 'pending', assignee: MEMBER }, /담당자 본인만 할 수 있습니다/],
+    // task_add 의 인자 검사도 승격보다 앞이어야 합니다(리뷰 28).
+    ['잘못된 target', MEMBER, 'task_add', { group_id: groupId, content: '새 일', batch: 'b1', spec: '기준', assignee: MEMBER, target: [0] }, /target은 양의 정수 태스크 번호 배열이어야 합니다/],
+    ['잘못된 priority', MEMBER, 'task_add', { group_id: groupId, content: '새 일', batch: 'b1', spec: '기준', assignee: MEMBER, priority: '높음' }, /priority는 정수여야 합니다/],
+  ];
+
+  for (const [label, surface, tool, args, pattern] of refusals) {
+    const { project, before: checksum } = seedLegacyWithMember(`task-mcp-root-refuse-${tool}-`);
+    assert.match(callToolError(PROJECT_SERVER, project, tool, args, surface), pattern, label);
+    assert.equal(fs.existsSync(mcpTaskGroupDir(project, groupId)), false, `${label}: 새 자리에 사본이 생겼습니다.`);
+    assert.equal(treeChecksum(legacyTaskGroupDir(project, groupId)), checksum, `${label}: 옛 자리가 바뀌었습니다.`);
+    assert.equal(fs.existsSync(path.join(project, '.task-mcp-fake-cmux.jsonl')), false, `${label}: 보고가 나갔습니다.`);
+  }
+
+  // 대조군 — 통과하는 요청은 예전처럼 승격하고 옛 자리는 그대로 둡니다.
+  const { project, before: checksum } = seedLegacyWithMember('task-mcp-root-refuse-ok-');
+  callTool(PROJECT_SERVER, project, 'task_update', { group_id: groupId, number: 1, priority: 5 }, MEMBER);
+  assert.equal(fs.existsSync(mcpTaskGroupDir(project, groupId)), true, '통과한 요청은 승격해야 합니다.');
+  assert.equal(treeChecksum(legacyTaskGroupDir(project, groupId)), checksum, '옛 자리는 그대로 둡니다.');
+
+  // task_add 대조군 — 인자가 멀쩡하면 옛 그룹 전체가 승격하고 태스크가 새 자리에 생깁니다.
+  const added = seedLegacyWithMember('task-mcp-root-add-ok-');
+  callTool(PROJECT_SERVER, added.project, 'task_add', {
+    group_id: groupId, content: '새 일', batch: 'b1', spec: '기준', assignee: MEMBER, target: [1], priority: 2,
+  }, MEMBER);
+  const addedDir = mcpTaskGroupDir(added.project, groupId);
+  assert.equal(fs.existsSync(addedDir), true, '정상 추가는 승격해야 합니다.');
+  assert.ok(taskFile(addedDir, 3), '새 태스크가 새 자리에 생겨야 합니다.');
+  assert.equal(treeChecksum(legacyTaskGroupDir(added.project, groupId)), added.before, '옛 자리는 그대로 둡니다.');
+  console.log(`refused_requests_promote_nothing=${refusals.length}`);
+  console.log('accepted_request_still_promotes=true');
 });

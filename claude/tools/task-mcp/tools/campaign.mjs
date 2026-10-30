@@ -3,50 +3,39 @@ import path from 'node:path';
 
 import {
   OWNER,
+  applyMode,
   campaignContextDir,
   campaignDir,
   campaignGroupIds,
+  campaignNotesDir,
   createIfAbsent,
   datedName,
   listCampaignNames,
-  mainContextDir,
   markdownRecordFileName,
   now,
   numberedMarkdownFiles,
+  parseMarkdownRecord,
+  projectDir,
+  readGroupRecord,
   readTasks,
   readTextOr,
+  rejectLegacyAppend,
   renderMarkdownRecord,
   requireCampaign,
   slug,
   subDirNames,
+  withLineNumbers,
 } from '../lib.mjs';
 import { groupDocuments } from './group.mjs';
 import { renderGroup } from './task.mjs';
 
-// 설계상 차례에 올리지 않는 문서 — 정합 검사에서 제외한다.
-// NOTES.md는 던져두는 자리이지 주제 문서가 아니다. 이걸 어긋남으로 치면 노트를 쓰는
-// 캠페인마다 영구 경고가 붙고, 경보가 소음이 되면 진짜 어긋남을 놓친다.
-const UNLISTED_DOCS = new Set(['README.md', 'INDEX.md', 'NOTES.md']);
-
-function legacyContextDocs(name) {
-  try {
-    return fs.readdirSync(mainContextDir(name))
-      .filter((f) => f.endsWith('.md') && !UNLISTED_DOCS.has(f))
-      .sort();
-  } catch { return []; }
-}
-
 function readIndex(file) {
   const lines = readTextOr(file).split('\n').filter((line) => line.startsWith('- '));
   const entries = lines.flatMap((line) => {
-    const match = /^- \[[^\]]*\]\(([^)]+)\)/.exec(line);
+    const match = /^- \[.*\]\(([^)]+)\)/.exec(line);
     return match ? [match[1].replace(/^\.\//, '')] : [];
   });
   return { lines, entries };
-}
-
-function legacyIndex(name) {
-  return readIndex(path.join(mainContextDir(name), 'INDEX.md'));
 }
 
 function currentIndex(name) {
@@ -55,33 +44,20 @@ function currentIndex(name) {
 
 function campaignStatus(name) {
   const current = readTextOr(path.join(campaignContextDir(name), 'MAIN_CONTEXT.md'));
-  const legacy = readTextOr(path.join(mainContextDir(name), 'README.md'));
-  const m = (current || legacy).match(/^상태:\s*(.+)$/m);
+  const m = current.match(/^상태:[ \t]*(.+)$/m);
   return m ? m[1].trim() : '';
 }
 
 function contextView(name) {
-  const legacyDocs = legacyContextDocs(name);
-  const topics = subDirNames(campaignContextDir(name)).filter((topic) => topic !== 'notes').sort();
-  const legacy = legacyIndex(name);
+  const docs = numberedMarkdownFiles(campaignContextDir(name), 'context').map((entry) => entry.file);
+  const topics = subDirNames(campaignNotesDir(name)).sort().map((topic) => `../campaign-notes/${topic}/`);
   const current = currentIndex(name);
-  const entries = [...legacy.entries, ...current.entries];
-  const lines = [...legacy.lines, ...current.lines];
-  const normalized = entries.map((entry) => entry.replace(/\/+$/, ''));
-  const notIndexed = [
-    ...legacyDocs.filter((doc) => !normalized.includes(doc)),
-    ...topics.filter((topic) => !normalized.includes(topic)).map((topic) => `${topic}/`),
-  ];
-  const ghosts = entries.filter((entry) => {
-    const target = entry.replace(/\/+$/, '');
-    return !legacyDocs.includes(target) && !topics.includes(target);
-  });
-  return { lines, notIndexed, ghosts };
-}
-
-function attachedLines(name, file) {
-  return readTextOr(path.join(campaignDir(name), file))
-    .split('\n').filter((l) => l.trim().startsWith('- '));
+  const normalized = current.entries.map((entry) => entry.replace(/\/+$/, ''));
+  const actual = [...docs, ...topics];
+  const notIndexed = actual.filter((entry) => !normalized.includes(entry.replace(/\/+$/, '')));
+  const actualNormalized = actual.map((entry) => entry.replace(/\/+$/, ''));
+  const ghosts = current.entries.filter((entry) => !actualNormalized.includes(entry.replace(/\/+$/, '')));
+  return { lines: current.lines, notIndexed, ghosts };
 }
 
 function dateNotice(strippedDates) {
@@ -92,16 +68,17 @@ function dateNotice(strippedDates) {
 
 function ensureCurrentStructure(name) {
   const context = campaignContextDir(name);
-  fs.mkdirSync(path.join(context, 'notes'), { recursive: true });
-  fs.mkdirSync(path.join(campaignDir(name), 'researches'), { recursive: true });
-  createIfAbsent(path.join(context, 'INDEX.md'), `# ${name} — campaign-context 차례\n\n`);
+  fs.mkdirSync(context, { recursive: true });
+  fs.mkdirSync(campaignNotesDir(name), { recursive: true });
+  createIfAbsent(path.join(context, 'INDEX.md'), `# ${name} — campaign-main-context 차례\n\n`);
 }
 
 function registerTopic(name, topic) {
   const index = path.join(campaignContextDir(name), 'INDEX.md');
-  const registered = currentIndex(name).entries.some((entry) => entry.replace(/\/+$/, '') === topic);
+  const target = `../campaign-notes/${topic}/`;
+  const registered = currentIndex(name).entries.some((entry) => entry.replace(/\/+$/, '') === target.slice(0, -1));
   if (registered) return false;
-  fs.appendFileSync(index, `- [${topic}](${topic}/)\n`);
+  fs.appendFileSync(index, `- [${topic}](${target})\n`);
   return true;
 }
 
@@ -109,25 +86,24 @@ export function toolCampaignAdd({ name, about }) {
   if (!name) throw new Error('name은 필수입니다.');
   const named = datedName(name);
   if (fs.existsSync(campaignDir(named.id))) throw new Error(`이미 있는 캠페인입니다: ${named.id}`);
+  // 새 캠페인은 항상 새 루트에 만듭니다. 기존 캠페인 읽기에는 루트 폴백을 유지합니다.
+  fs.mkdirSync(path.join(projectDir(), '.claude', 'mcp-task-campaign'), { recursive: true });
   ensureCurrentStructure(named.id);
   createIfAbsent(path.join(campaignContextDir(named.id), 'MAIN_CONTEXT.md'),
-    `# ${named.id}\n\n상태: 진행 중\n\n${about || '(설명 없음 — 이 자리에 무엇을 왜 하는 일이고 무엇은 안 할지 적는다)'}\n\n` +
-    `> 이 문서는 사람이 관리한다. 도구는 만들 때 말고는 건드리지 않는다.\n` +
-    `> 끝나면 위 "상태:" 줄을 "상태: 종료 (YYYY-MM-DD) — 한 줄 이유" 로 바꾼다.\n`);
+    `# ${named.id}\n\n상태: 진행 중\n\n${about || '(설명이 없습니다. 이 일의 목적과 범위를 적으십시오.)'}\n`);
   return `${dateNotice(named.strippedDates)}캠페인 생성: ${named.id}\n` +
-    `- .claude/campaigns/${named.id}/campaign-context/MAIN_CONTEXT.md (머리말 — 이후 사람이 관리)\n\n` +
-    `(태스크 그룹은 task_group_add{campaign:"${named.id}", topic:"…"}, 맥락은 campaign_note{name:"${named.id}", title:"…", text:"…"}, 펼쳐보기는 campaign_read{name:"${named.id}"})`;
+    `- .claude/mcp-task-campaign/${named.id}/campaign-main-context/MAIN_CONTEXT.md\n\n` +
+    `태스크 그룹은 task_group_add, 맥락은 campaign_context_add로 추가하고 campaign_read로 읽으십시오.`;
 }
 
 export function toolCampaignRead({ name, full } = {}) {
   const id = requireCampaign(name);
   const currentMain = readTextOr(path.join(campaignContextDir(id), 'MAIN_CONTEXT.md'));
-  const legacyMain = readTextOr(path.join(mainContextDir(id), 'README.md'));
-  const out = [(currentMain || legacyMain || '(MAIN_CONTEXT 없음)').trim()];
+  const out = [(currentMain || '(MAIN_CONTEXT 없음)').trim()];
 
   // 차례 — 도구가 관리한다
   const context = contextView(id);
-  out.push(`## 차례 (campaign-context)\n${context.lines.length
+  out.push(`## 차례 (campaign-main-context)\n${context.lines.length
     ? context.lines.join('\n')
     : '(빈 차례)'}`);
 
@@ -138,17 +114,6 @@ export function toolCampaignRead({ name, full } = {}) {
       `  실물이 없는 등재: ${context.ghosts.length ? context.ghosts.join(', ') : '없음'}`);
   }
 
-  // 새 리서치 폴더와 옛 연결 파일. 옛 plans.md·researches.md는 읽기만 한다.
-  const researchDirs = subDirNames(path.join(campaignDir(id), 'researches')).sort();
-  const plans = attachedLines(id, 'plans.md'), researches = attachedLines(id, 'researches.md');
-  const latest = (lines, label) => (lines.length ? `\n  최근 ${label}: ${lines[lines.length - 1].replace(/^-\s*/, '')}` : '');
-  out.push(full
-    ? `## 리서치 폴더 ${researchDirs.length}개\n${researchDirs.map((dir) => `- researches/${dir}/`).join('\n') || '(없음)'}\n\n` +
-      `### 옛 plans.md ${plans.length}건 (읽기 전용)\n${plans.join('\n') || '(없음)'}\n\n` +
-      `### 옛 researches.md ${researches.length}건 (읽기 전용)\n${researches.join('\n') || '(없음)'}`
-    : `## 리서치 폴더 ${researchDirs.length}개 · 옛 계획서 ${plans.length}건 · 옛 조사 ${researches.length}건  (목록은 full:true)` +
-      latest(plans, '계획서') + latest(researches, '조사'));
-
   // 그룹 — 기본은 진행 중인 것만
   const gids = campaignGroupIds(id);
   const blocks = [];
@@ -156,30 +121,50 @@ export function toolCampaignRead({ name, full } = {}) {
   for (const g of gids) {
     const dir = path.join(campaignDir(id), g);
     const tasks = readTasks(dir);
-    const open = tasks.filter((t) => t.status !== 'completed').length;
-    if (!full && (!tasks.length || open === 0)) { hidden += 1; continue; }
-    const { notes, plans: groupPlans } = groupDocuments(dir);
-    blocks.push(`${renderGroup(g, tasks, true)}\n  노트 ${notes.length} · 계획서 ${groupPlans.length}`);
+    if (!full && readGroupRecord(dir)?.status === 'done') { hidden += 1; continue; }
+    const { notes, plans: groupPlans, researches } = groupDocuments(dir);
+    blocks.push(`${renderGroup(g, tasks, true)}\n  노트 ${notes.length}개 · 계획서 ${groupPlans.length}개 · 조사 ${researches.length}개`);
   }
-  out.push(`## 태스크 그룹 ${gids.length}개\n${blocks.join('\n\n') || '(진행 중인 그룹 없음)'}` +
-    (hidden ? `\n\n(끝났거나 빈 그룹 ${hidden}개는 숨김 — full:true로 전체)` : ''));
+  // 머리는 전체를 세고 몸은 진행 중만 보이던 자리라 두 수를 함께 적습니다(백로그 14).
+  const heading = full
+    ? `## 태스크 그룹 ${gids.length}개`
+    : `## 태스크 그룹 — 진행 중 ${blocks.length}개 / 전체 ${gids.length}개`;
+  out.push(`${heading}\n${blocks.join('\n\n') || '(진행 중인 그룹 없음)'}` +
+    (hidden ? `\n\n(완료 그룹 ${hidden}개를 숨겼습니다. full:true로 전부 볼 수 있습니다.)` : ''));
 
   return out.join('\n\n');
 }
 
-export function toolCampaignNote({ name, title, text, topic }) {
+function oneLine(value, label) {
+  if (typeof value !== 'string' || !value.trim() || /[\r\n]/.test(value)) {
+    throw new Error(`${label} 은 비어 있지 않은 한 줄 문자열이어야 합니다`);
+  }
+}
+
+function documentLocation(name, topic) {
   const id = requireCampaign(name);
-  if (!title || text == null) throw new Error('name, title, text는 필수입니다.');
-  if (topic != null && !String(topic).trim()) throw new Error('topic은 빈 문자열일 수 없습니다.');
-  ensureCurrentStructure(id);
+  if (topic != null) oneLine(topic, 'topic');
   const topicId = topic == null ? null : slug(topic);
-  const relativeDir = topicId || 'notes';
-  const dir = path.join(campaignContextDir(id), relativeDir);
-  fs.mkdirSync(dir, { recursive: true });
-  const existing = numberedMarkdownFiles(dir, 'note');
+  return {
+    id, topicId,
+    prefix: topicId ? 'note' : 'context',
+    dir: topicId ? path.join(campaignNotesDir(id), topicId) : campaignContextDir(id),
+  };
+}
+
+function indexLabel(title) {
+  return title.replace(/\\/g, '\\\\').replace(/[\[\]]/g, '\\$&');
+}
+
+export function toolCampaignContextAdd({ name, title, text, topic }) {
+  oneLine(title, 'title');
+  if (typeof text !== 'string') throw new Error('text 는 문자열이어야 합니다');
+  const location = documentLocation(name, topic);
+  const { id, topicId, prefix, dir } = location;
+  const existing = numberedMarkdownFiles(dir, prefix);
   const number = existing.reduce((max, note) => Math.max(max, note.number), 0) + 1;
   const timestamp = now();
-  const file = markdownRecordFileName('note', number, title);
+  const file = markdownRecordFileName(prefix, number, title);
   const record = renderMarkdownRecord({
     number,
     title: String(title),
@@ -187,20 +172,96 @@ export function toolCampaignNote({ name, title, text, topic }) {
     created_at: timestamp,
     updated_at: timestamp,
   }, text);
+  ensureCurrentStructure(id);
+  fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, file), record, { flag: 'wx' });
-  const listed = topicId ? registerTopic(id, topicId) : false;
-  return `캠페인 노트 추가: name="${id}", file="campaign-context/${relativeDir}/${file}"${listed ? ' · 주제 폴더 차례 등재' : ''}.`;
+  if (topicId) registerTopic(id, topicId);
+  else fs.appendFileSync(path.join(campaignContextDir(id), 'INDEX.md'), `- [${indexLabel(title)}](${file})\n`);
+  return `캠페인 맥락 문서를 추가했습니다: name="${id}", number=${number}, file="${path.relative(campaignDir(id), path.join(dir, file))}".`;
 }
 
-export function toolCampaignResearch({ name, topic }) {
+function validateBodyUpdate(args, valueField) {
+  rejectLegacyAppend(args);
+  if (Object.hasOwn(args, 'body')) rejectLegacyAppend({ body: args.body });
+  if (args.field != null && args.field !== 'body') throw new Error('field 는 body 여야 합니다');
+  if (args.field == null && ['mode', 'text', 'at', 'old', 'new', 'replace_all', 'insert_after'].some((key) => Object.hasOwn(args, key))) {
+    throw new Error('본문을 고치려면 field:"body" 를 주십시오');
+  }
+  if (args[valueField] == null && args.field == null) throw new Error(`바꿀 값(${valueField} 또는 field)이 필요합니다`);
+  if (args[valueField] != null) oneLine(args[valueField], valueField);
+}
+
+function mainContextFile(name) {
   const id = requireCampaign(name);
-  if (!topic) throw new Error('name, topic은 필수입니다.');
-  ensureCurrentStructure(id);
-  const named = datedName(topic);
-  const dir = path.join(campaignDir(id), 'researches', named.id);
-  if (fs.existsSync(dir)) throw new Error(`이미 있는 리서치 폴더입니다: ${named.id}`);
-  fs.mkdirSync(dir);
-  return `${dateNotice(named.strippedDates)}리서치 폴더 생성: .claude/campaigns/${id}/researches/${named.id}/`;
+  const full = path.join(campaignContextDir(id), 'MAIN_CONTEXT.md');
+  if (!fs.existsSync(full)) throw new Error('MAIN_CONTEXT.md 를 찾지 못했습니다');
+  return { id, full, text: fs.readFileSync(full, 'utf8') };
+}
+
+export function toolCampaignMainContextGet({ name }) {
+  return withLineNumbers(mainContextFile(name).text);
+}
+
+export function toolCampaignMainContextUpdate(args) {
+  validateBodyUpdate(args, 'status');
+  const main = mainContextFile(args.name);
+  let text = args.field == null ? main.text : applyMode(main.text, args);
+  if (args.status != null) {
+    const statusLine = `상태: ${args.status}`;
+    if (/^상태:/m.test(text)) text = text.replace(/^상태:[^\r\n]*/m, () => statusLine);
+    else {
+      const lines = text ? text.split('\n') : [];
+      const heading = lines.findIndex((line) => /^# /.test(line));
+      let at = heading < 0 ? 0 : heading + 1;
+      if (heading >= 0) {
+        if (lines[at] === '') at += 1;
+        else { lines.splice(at, 0, ''); at += 1; }
+      }
+      lines.splice(at, 0, statusLine, '');
+      text = lines.join('\n');
+    }
+  }
+  fs.writeFileSync(main.full, text);
+  return `캠페인 본 맥락을 수정했습니다: name="${main.id}", file="campaign-main-context/MAIN_CONTEXT.md".`;
+}
+
+function readContext(name, number, topic) {
+  if (!Number.isInteger(number) || number < 1) throw new Error('number 는 양의 정수여야 합니다');
+  const location = documentLocation(name, topic);
+  const entry = numberedMarkdownFiles(location.dir, location.prefix).find((entry) => entry.number === number);
+  if (!entry) throw new Error(`${location.prefix}-${number} 를 찾지 못했습니다`);
+  const full = path.join(location.dir, entry.file);
+  const text = fs.readFileSync(full, 'utf8');
+  return { ...location, ...entry, full, text, ...parseMarkdownRecord(text) };
+}
+
+export function toolCampaignContextGet({ name, number, topic }) {
+  const doc = readContext(name, number, topic);
+  const headerEnd = doc.text.indexOf('\n---\n', 4) + 5;
+  return `${doc.text.slice(0, headerEnd)}\n${withLineNumbers(doc.body)}\n`;
+}
+
+export function toolCampaignContextUpdate(args) {
+  validateBodyUpdate(args, 'title');
+  const doc = readContext(args.name, args.number, args.topic);
+  const title = args.title ?? doc.metadata.title;
+  const body = args.field == null ? doc.body : applyMode(doc.body, args);
+  const file = markdownRecordFileName(doc.prefix, doc.number, title);
+  const full = path.join(doc.dir, file);
+  const text = renderMarkdownRecord({ ...doc.metadata, title, updated_at: now() }, body);
+  if (full !== doc.full && fs.existsSync(full)) throw new Error(`이미 있는 맥락 문서입니다: ${file}`);
+  const index = path.join(campaignContextDir(doc.id), 'INDEX.md');
+  const previousIndex = doc.topicId ? '' : readTextOr(index);
+  const nextIndex = previousIndex.split('\n').map((line) => {
+    const match = /^- \[.*\]\(([^)]+)\)/.exec(line);
+    if (!match || match[1].replace(/^\.\//, '') !== doc.file) return line;
+    return `- [${indexLabel(title)}](${file})${line.slice(match[0].length)}`;
+  }).join('\n');
+  // 편집·앞머리·개명 검사를 모두 마친 뒤에만 문서와 차례를 씁니다.
+  fs.writeFileSync(doc.full, text);
+  if (file !== doc.file) fs.renameSync(doc.full, full);
+  if (previousIndex !== nextIndex) fs.writeFileSync(index, nextIndex);
+  return `캠페인 맥락 문서를 수정했습니다: name="${doc.id}", number=${doc.number}, file="${path.relative(campaignDir(doc.id), full)}".`;
 }
 
 export function toolCampaignList() {
@@ -214,7 +275,7 @@ export function toolCampaignList() {
       total += ts.length;
       open += ts.filter((t) => t.status !== 'completed').length;
     }
-    return `- ${n} — ${campaignStatus(n) || '상태 미표기'} · 그룹 ${gids.length} · 남은 태스크 ${open}/${total}`;
+    return `- ${n} — ${campaignStatus(n) || '상태 미표기'} · 그룹 ${gids.length}개 · 남은 태스크 ${open}/${total}개`;
   });
   return `${rows.join('\n')}\n\n(펼쳐보기: campaign_read{name:"…"})`;
 }
